@@ -1,0 +1,97 @@
+import os, io, csv, json, threading, uuid, sys
+from flask import Flask, render_template, request, jsonify, send_file
+from race_parser import parse_pdf, compute_race
+
+# Force unbuffered output
+sys.stdout.flush()
+sys.stderr.flush()
+
+app = Flask(__name__)
+app.config["UPLOAD_FOLDER"] = "uploads"
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# In-memory job store
+jobs = {}
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    f = request.files.get("pdf")
+    if not f:
+        return jsonify({"error": "No file"}), 400
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "processing"}
+
+    path = os.path.join(app.config["UPLOAD_FOLDER"], job_id + ".pdf")
+    f.save(path)
+
+    def process():
+        try:
+            races = parse_pdf(path)
+
+            if not races:
+                jobs[job_id] = {"status": "error", "error": "No races found in PDF. Check if PDF format matches expected structure."}
+                return
+
+            result = []
+            for race in races:
+                rows = compute_race(race)
+                if rows:
+                    result.append({
+                        "race_num": race["race_num"],
+                        "race_name": race["race_name"],
+                        "current_dist": race["current_dist"],
+                        "rows": rows
+                    })
+
+            if not result:
+                jobs[job_id] = {"status": "error", "error": "PDF processed but no valid race data found."}
+            else:
+                jobs[job_id] = {"status": "done", "result": result}
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"[ERROR] {error_details}")
+            jobs[job_id] = {"status": "error", "error": str(e)}
+        finally:
+            try: os.remove(path)
+            except: pass
+
+    threading.Thread(target=process, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/result/<job_id>")
+def result(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
+
+@app.route("/download", methods=["POST"])
+def download():
+    data = request.json
+    si = io.StringIO()
+    cols = ["Sl.No","Name","Old Weight","New Weight","Old Distance",
+            "Current Distance","Old Time(sec)","PNR Race","Standard PNR",
+            "Adjusted Time","Speed Rating","ODDS","Final Rating",
+            "Speed Rank","Odds Rank","Value Score"]
+    writer = csv.writer(si)
+    for race in data:
+        writer.writerow([f"Race {race['race_num']} - {race['race_name']} ({race['current_dist']}m)"])
+        writer.writerow(cols)
+        for row in race["rows"]:
+            writer.writerow([row.get(c, "") for c in cols])
+        writer.writerow([])
+    output = io.BytesIO()
+    output.write(si.getvalue().encode("utf-8-sig"))
+    output.seek(0)
+    return send_file(output, mimetype="text/csv",
+                     as_attachment=True, download_name="race_analysis_last_row.csv")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5051))
+    app.run(host="0.0.0.0", port=port, debug=False)
